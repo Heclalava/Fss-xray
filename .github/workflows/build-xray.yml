@@ -1,0 +1,233 @@
+name: Build Xray ARM64 candidate
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: xray-arm64-candidate
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl jq unzip xz-utils binutils file qemu-user
+
+      - name: Resolve latest stable Xray release
+        id: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          API="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
+          RELEASE="$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            "$API")"
+
+          TAG="$(jq -er '.tag_name' <<< "$RELEASE")"
+          PRERELEASE="$(jq -r '.prerelease' <<< "$RELEASE")"
+          DRAFT="$(jq -r '.draft' <<< "$RELEASE")"
+
+          if [[ "$PRERELEASE" != "false" || "$DRAFT" != "false" ]]; then
+            echo "Latest release endpoint returned a prerelease or draft."
+            exit 1
+          fi
+
+          ZIP_URL="$(jq -er \
+            '[.assets[] | select(.name == "Xray-linux-arm64-v8a.zip")][0].browser_download_url' \
+            <<< "$RELEASE")"
+
+          DGST_URL="$(jq -er \
+            '[.assets[] | select(.name == "Xray-linux-arm64-v8a.zip.dgst")][0].browser_download_url' \
+            <<< "$RELEASE")"
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "zip_url=$ZIP_URL" >> "$GITHUB_OUTPUT"
+          echo "dgst_url=$DGST_URL" >> "$GITHUB_OUTPUT"
+
+          echo "Selected upstream release: $TAG"
+
+      - name: Skip existing candidate
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          CANDIDATE_TAG="candidate-${UPSTREAM_TAG}"
+          echo "tag=$CANDIDATE_TAG" >> "$GITHUB_OUTPUT"
+
+          if gh release view "$CANDIDATE_TAG" \
+              --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Candidate $CANDIDATE_TAG already exists; nothing to do."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download and verify upstream archive
+        if: steps.candidate.outputs.exists != 'true'
+        env:
+          ZIP_URL: ${{ steps.upstream.outputs.zip_url }}
+          DGST_URL: ${{ steps.upstream.outputs.dgst_url }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p work
+          curl -fL --retry 3 "$ZIP_URL" -o work/xray.zip
+          curl -fL --retry 3 "$DGST_URL" -o work/xray.zip.dgst
+
+          EXPECTED_SHA256="$(
+            awk -F'= ' '$1 == "SHA2-256" { print $2 }' \
+              work/xray.zip.dgst | tr -d '\r'
+          )"
+
+          if [[ ! "$EXPECTED_SHA256" =~ ^[a-fA-F0-9]{64}$ ]]; then
+            echo "Could not parse upstream SHA2-256 checksum."
+            exit 1
+          fi
+
+          printf '%s  %s\n' "$EXPECTED_SHA256" work/xray.zip \
+            | sha256sum --check --strict
+
+          echo "Upstream archive checksum verified."
+
+      - name: Install pinned UPX
+        if: steps.candidate.outputs.exists != 'true'
+        run: |
+          set -euo pipefail
+
+          UPX_VERSION="5.2.1"
+          UPX_ARCHIVE="upx-${UPX_VERSION}-amd64_linux.tar.xz"
+          UPX_SHA256="402162aad30af47e60dbd767fb2e64ca394ace9727ba1f40283641f1d1b91657"
+
+          curl -fL --retry 3 \
+            "https://github.com/upx/upx/releases/download/v${UPX_VERSION}/${UPX_ARCHIVE}" \
+            -o "$RUNNER_TEMP/$UPX_ARCHIVE"
+
+          printf '%s  %s\n' "$UPX_SHA256" "$RUNNER_TEMP/$UPX_ARCHIVE" \
+            | sha256sum --check --strict
+
+          mkdir -p "$RUNNER_TEMP/upx"
+          tar -xJf "$RUNNER_TEMP/$UPX_ARCHIVE" \
+            -C "$RUNNER_TEMP/upx"
+
+          UPX_BIN="$(find "$RUNNER_TEMP/upx" -type f -name upx \
+            -perm /111 -print -quit)"
+
+          test -n "$UPX_BIN"
+          "$UPX_BIN" --version | tee "$RUNNER_TEMP/upx-version.txt"
+          grep -Fi "upx ${UPX_VERSION}" "$RUNNER_TEMP/upx-version.txt"
+
+          echo "UPX_BIN=$UPX_BIN" >> "$GITHUB_ENV"
+
+      - name: Extract and validate Xray binary
+        if: steps.candidate.outputs.exists != 'true'
+        run: |
+          set -euo pipefail
+
+          mapfile -t XRAY_ENTRIES < <(
+            unzip -Z1 work/xray.zip | grep -E '(^|/)xray$' || true
+          )
+
+          if [[ "${#XRAY_ENTRIES[@]}" -ne 1 ]]; then
+            echo "Expected exactly one xray executable in upstream archive."
+            printf '%s\n' "${XRAY_ENTRIES[@]}"
+            exit 1
+          fi
+
+          unzip -p work/xray.zip "${XRAY_ENTRIES[0]}" > work/xray
+          chmod 0755 work/xray
+
+          file work/xray
+          readelf -h work/xray | grep -F "AArch64"
+
+          qemu-aarch64 ./work/xray version | tee work/xray-version.txt
+
+      - name: Compress and validate binary
+        if: steps.candidate.outputs.exists != 'true'
+        run: |
+          set -euo pipefail
+
+          "$UPX_BIN" --lzma --ultra-brute work/xray
+          "$UPX_BIN" -t work/xray
+
+          qemu-aarch64 ./work/xray version | tee work/xray-compressed-version.txt
+          diff -u work/xray-version.txt work/xray-compressed-version.txt
+
+          file work/xray
+          readelf -h work/xray | grep -F "AArch64"
+
+          chmod 0755 work/xray
+          sha256sum work/xray | tee work/xray.sha256
+          stat -c 'Compressed binary size: %s bytes' work/xray
+
+      - name: Create candidate metadata
+        if: steps.candidate.outputs.exists != 'true'
+        env:
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+          CANDIDATE_TAG: ${{ steps.candidate.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          UPSTREAM_SHA256="$(sha256sum work/xray.zip | awk '{print $1}')"
+
+          BINARY_SHA256="$(sha256sum work/xray | awk '{print $1}')"
+          XRAY_VERSION="$(tr '\n' ' ' < work/xray-version.txt)"
+          UPX_VERSION="$("$UPX_BIN" --version | head -n 1)"
+
+          jq -n \
+            --arg upstream_tag "$UPSTREAM_TAG" \
+            --arg candidate_tag "$CANDIDATE_TAG" \
+            --arg upstream_sha256 "$UPSTREAM_SHA256" \
+            --arg binary_sha256 "$BINARY_SHA256" \
+            --arg xray_version "$XRAY_VERSION" \
+            --arg upx_version "$UPX_VERSION" \
+            --arg compression "--lzma --ultra-brute" \
+            '{
+              upstream_repository: "XTLS/Xray-core",
+              upstream_tag: $upstream_tag,
+              candidate_tag: $candidate_tag,
+              upstream_archive: "Xray-linux-arm64-v8a.zip",
+              upstream_archive_sha256: $upstream_sha256,
+              architecture: "linux/arm64",
+              xray_version_output: $xray_version,
+              upx_version: $upx_version,
+              upx_options: $compression,
+              binary: "xray",
+              binary_sha256: $binary_sha256
+            }' > work/metadata.json
+
+          cat work/metadata.json
+
+      - name: Publish candidate prerelease
+        if: steps.candidate.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_TAG: ${{ steps.candidate.outputs.tag }}
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          gh release create "$CANDIDATE_TAG" \
+            work/xray \
+            work/metadata.json \
+            work/xray.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
+            --prerelease \
+            --title "Xray ${UPSTREAM_TAG} candidate" \
+            --notes "Automated ARM64 Xray candidate.
+
+          Upstream: https://github.com/XTLS/Xray-core/releases/tag/${UPSTREAM_TAG}
+
+          This is a test candidate, not a stable FancySS release.
+          Router testing and explicit promotion are required before customer distribution."
