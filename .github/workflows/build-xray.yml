@@ -1,4 +1,4 @@
-name: Build Xray ARM64 candidate
+name: Build and publish Xray ARM64 release
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: xray-arm64-candidate
+  group: xray-arm64-release
   cancel-in-progress: false
 
 jobs:
@@ -55,6 +55,22 @@ jobs:
 
           echo "Selected upstream release: $TAG"
 
+      - name: Skip existing stable release
+        id: stable
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$UPSTREAM_TAG" \
+              --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Stable release $UPSTREAM_TAG already exists; nothing to do."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Skip existing candidate
         id: candidate
         env:
@@ -75,7 +91,7 @@ jobs:
           fi
 
       - name: Download and verify upstream archive
-        if: steps.candidate.outputs.exists != 'true'
+        if: steps.stable.outputs.exists != 'true' && steps.candidate.outputs.exists != 'true'
         env:
           ZIP_URL: ${{ steps.upstream.outputs.zip_url }}
           DGST_URL: ${{ steps.upstream.outputs.dgst_url }}
@@ -102,7 +118,7 @@ jobs:
           echo "Upstream archive checksum verified."
 
       - name: Install pinned UPX
-        if: steps.candidate.outputs.exists != 'true'
+        if: steps.stable.outputs.exists != 'true' && steps.candidate.outputs.exists != 'true'
         run: |
           set -euo pipefail
 
@@ -131,7 +147,7 @@ jobs:
           echo "UPX_BIN=$UPX_BIN" >> "$GITHUB_ENV"
 
       - name: Extract and validate Xray binary
-        if: steps.candidate.outputs.exists != 'true'
+        if: steps.stable.outputs.exists != 'true' && steps.candidate.outputs.exists != 'true'
         run: |
           set -euo pipefail
 
@@ -154,7 +170,7 @@ jobs:
           qemu-aarch64 ./work/xray version | tee work/xray-version.txt
 
       - name: Compress and validate binary
-        if: steps.candidate.outputs.exists != 'true'
+        if: steps.stable.outputs.exists != 'true' && steps.candidate.outputs.exists != 'true'
         run: |
           set -euo pipefail
 
@@ -172,7 +188,7 @@ jobs:
           stat -c 'Compressed binary size: %s bytes' work/xray
 
       - name: Create candidate metadata
-        if: steps.candidate.outputs.exists != 'true'
+        if: steps.stable.outputs.exists != 'true' && steps.candidate.outputs.exists != 'true'
         env:
           UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
           CANDIDATE_TAG: ${{ steps.candidate.outputs.tag }}
@@ -210,7 +226,7 @@ jobs:
           cat work/metadata.json
 
       - name: Publish candidate prerelease
-        if: steps.candidate.outputs.exists != 'true'
+        if: steps.stable.outputs.exists != 'true' && steps.candidate.outputs.exists != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           CANDIDATE_TAG: ${{ steps.candidate.outputs.tag }}
@@ -231,3 +247,63 @@ jobs:
 
           This is a test candidate, not a stable FancySS release.
           Router testing and explicit promotion are required before customer distribution."
+
+      - name: Promote verified candidate to stable release
+        if: steps.stable.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+          CANDIDATE_TAG: ${{ steps.candidate.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p promote
+          gh release download "$CANDIDATE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir promote
+
+          test -s promote/xray
+          test -s promote/metadata.json
+          test -s promote/xray.sha256
+
+          jq -e \
+            --arg tag "$UPSTREAM_TAG" \
+            '.architecture == "linux/arm64" and
+             .binary == "xray" and
+             .upstream_tag == $tag and
+             (.binary_sha256 | test("^[a-f0-9]{64}$"))' \
+            promote/metadata.json >/dev/null
+
+          EXPECTED="$(jq -r '.binary_sha256' promote/metadata.json)"
+          CHECKSUM="$(awk 'NF {print tolower($1); exit}' promote/xray.sha256)"
+          ACTUAL="$(sha256sum promote/xray | awk '{print $1}')"
+
+          test "$EXPECTED" = "$CHECKSUM"
+          test "$EXPECTED" = "$ACTUAL"
+          echo "Candidate binary and metadata verified."
+
+          chmod 0755 promote/xray
+
+          EXPECTED_VERSION="$(jq -r '.xray_version_output' promote/metadata.json)"
+          ACTUAL_VERSION="$(qemu-aarch64 promote/xray -version | tr '\n' ' ')"
+
+          if [[ "$ACTUAL_VERSION" != "$EXPECTED_VERSION" ]]; then
+            echo "Binary -version output does not match candidate metadata."
+            printf 'Expected: %s\nActual:   %s\n' "$EXPECTED_VERSION" "$ACTUAL_VERSION"
+            exit 1
+          fi
+
+          echo "Candidate version output verified."
+
+          gh release create "$UPSTREAM_TAG" \
+            promote/xray \
+            promote/metadata.json \
+            promote/xray.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Xray ${UPSTREAM_TAG}" \
+            --notes "Automated ARM64 Xray stable release.
+
+          Upstream: https://github.com/XTLS/Xray-core/releases/tag/${UPSTREAM_TAG}
+
+          This release was automatically built and verified.
+          Router compatibility testing is performed before customer update announcements."
